@@ -59,6 +59,7 @@ import BOQPreview from "./BOQPreview";
 import { formatAmount } from "../../utils/formatAmount";
 import ItemFormModal from "../../components/ItemFormModal";
 import CategorySelect from "../../components/CategorySelect";
+import EstimationReference from "../../components/EstimationReference";
 import { getScheduleConfig } from "../../data/scheduleConfig";
 import { roomColor } from "../../data/categoryColors";
 
@@ -707,6 +708,14 @@ const BOQEditor = () => {
                 )}
               </div>
             </section>
+
+            {/* Estimation reference — live from Proposal Master, read-only */}
+            {boq.basedOnPreset && (
+              <EstimationReference
+                presetKey={boq.basedOnPreset}
+                propertyType={boq.project?.propertyType}
+              />
+            )}
 
             {/* Sections */}
             <section className="space-y-4">

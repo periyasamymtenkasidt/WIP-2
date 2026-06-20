@@ -187,6 +187,9 @@ const normalizePreset = (p) => {
       scopeItems: (c.scopeItems || []).map(mapScopeItem),
       inclusions: c.inclusions || [],
       exclusions: c.exclusions || [],
+      // Category Allocation (%) keyed by canonical category (scope `area`).
+      // Scope Allocation (%) lives on each scope item as `allocationPct`.
+      categoryAllocations: c.categoryAllocations || {},
     }));
     // Remove legacy top-level fields after migration
     delete next.propertyType;
@@ -215,6 +218,7 @@ const normalizePreset = (p) => {
     scopeItems: sharedScope.map(mapScopeItem),
     inclusions: [...sharedInclusions],
     exclusions: [...sharedExclusions],
+    categoryAllocations: {},
   }));
 
   // Clean up legacy top-level fields
@@ -256,12 +260,25 @@ export const getMaster = () => {
   return normalizedDefault;
 };
 
+// Dispatched whenever Proposal Master changes so that any mounted consumer
+// (EstimationReference, etc.) can recompute live from this single source of
+// truth — no allocation %s or derived quantities are duplicated downstream.
+export const MASTER_EVENT = "quoteMasterChanged";
+
+const notifyMasterChanged = () => {
+  if (typeof window !== "undefined") {
+    window.dispatchEvent(new CustomEvent(MASTER_EVENT));
+  }
+};
+
 export const saveMaster = (master) => {
   localStorage.setItem(MASTER_KEY, JSON.stringify(master));
+  notifyMasterChanged();
 };
 
 export const resetMaster = () => {
   localStorage.removeItem(MASTER_KEY);
+  notifyMasterChanged();
 };
 
 export const getPresets = () => getMaster();

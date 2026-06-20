@@ -18,6 +18,7 @@ import {
 import { storeFile, getFile, deleteFile } from "../../../utils/fileStorage";
 import { DIMENSIONAL_UNITS } from "../../../data/boqStorage";
 import { elKey, qtyFor } from "../../../data/surveyMeasureStorage";
+import EstimationReference from "../../../components/EstimationReference";
 import {
   getPipeline,
   stageHasSamples,
@@ -327,6 +328,17 @@ const DesignPipeline = ({ site }) => {
                       </button>
                     )}
                   </div>
+
+                  {/* Estimation reference — live from Proposal Master, read-only */}
+                  {site.propertyPreset && (
+                    <div className="mb-3">
+                      <EstimationReference
+                        presetKey={site.propertyPreset}
+                        sqft={basis.totalSqft}
+                        title="BOQ & Costing Estimation Reference"
+                      />
+                    </div>
+                  )}
 
                   {!stage.boq ? (
                     <p className="rounded-xl border border-dashed border-bordergray py-6 text-center text-[12.5px] text-text-subtle">

@@ -33,6 +33,7 @@ import {
   getMilestonesForLead,
 } from "../../data/LeadStatusConfig";
 import ProjectSchedule from "./ProjectSchedule";
+import EstimationReference from "../../components/EstimationReference";
 import avatar from "../../assets/images/avatar.png";
 
 // Read-only Project view. All edits (status changes, calls, notes, milestone
@@ -791,6 +792,16 @@ const ProjectDetail = () => {
               </div>
             </div>
           </div>
+
+          {/* Costing estimation reference — live from Proposal Master, read-only */}
+          {lead.quotePreset && (
+            <EstimationReference
+              presetKey={lead.quotePreset}
+              propertyType={lead.propertyType}
+              sizeRange={lead.quoteSizeRange}
+              title="Costing Estimation Reference"
+            />
+          )}
 
           {/* Schedule — room-by-room plan with escalation */}
           <ProjectSchedule lead={lead} />

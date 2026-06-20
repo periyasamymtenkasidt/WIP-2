@@ -28,6 +28,7 @@ import DesignWorkspace from "./components/DesignWorkspace";
 import DesignPipeline from "./components/DesignPipeline";
 import SurveyMeasurements from "./components/SurveyMeasurements";
 import Feasibility from "./components/Feasibility";
+import EstimationReference from "../../components/EstimationReference";
 import { getDesignFlow } from "../../data/designFlowStorage";
 import { getSiteServiceTrack } from "../../data/surveyMeasureStorage";
 
@@ -352,6 +353,13 @@ const SiteDetail = () => {
             </div>
 
               <div className="flex flex-col gap-3">
+                {/* Estimation reference — live from Proposal Master, read-only */}
+                {site.propertyPreset && (
+                  <EstimationReference
+                    presetKey={site.propertyPreset}
+                    title="Scope Estimation Reference"
+                  />
+                )}
                 {/* Site incharge with call actions */}
                 <div className="flex items-center justify-between gap-3 p-2.5 border border-bg-soft bg-palewhite rounded-[12px]">
                   <div className="flex items-center gap-2.5 min-w-0">

@@ -38,6 +38,9 @@ import {
   Keyboard,
   Pencil,
   Eye,
+  PieChart,
+  Percent,
+  Scale,
 } from "lucide-react";
 import {
   getMaster,
@@ -63,6 +66,13 @@ import {
   getRoomDefaultDays,
 } from "../../../data/scheduleConfig";
 import { computeLibraryItemAmount, listLibrary } from "../../../data/itemLibrary";
+import {
+  estimateScopeQuantities,
+  parseBaseArea as parsePresetArea,
+  getStandardSqft,
+  getCategorySqft,
+  getScopeQuantity,
+} from "../../../data/estimationEngine";
 import { listMaterials } from "../../../data/materialLibrary";
 import { computeRecipe, materialsById } from "../../../data/rateBuildup";
 import { PROPERTY_TYPES } from "../../../helperConfigData/helperData";
@@ -171,6 +181,118 @@ const getCategory = (area) => {
   return { color: "gray", icon: Package };
 };
 
+// Collect allocation rule violations across the whole master so an explicit
+// save can be blocked until every total is exactly 100%. A configuration is
+// only validated once allocation has been "started" (any category % or any
+// scope % set) — untouched presets stay exempt so the feature is opt-in.
+// Percentages are never auto-adjusted; we only report.
+const collectAllocationIssues = (master) => {
+  const issues = [];
+  for (const presetKey of Object.keys(master || {})) {
+    const preset = master[presetKey];
+    const label = preset?.label || presetKey;
+    for (const cfg of preset?.configurations || []) {
+      const items = cfg.scopeItems || [];
+      const alloc = cfg.categoryAllocations || {};
+
+      // Group scope rows by their category (the `area`).
+      const byCat = new Map();
+      for (const s of items) {
+        const cat = s.area || "Unassigned";
+        if (!byCat.has(cat)) byCat.set(cat, []);
+        byCat.get(cat).push(s);
+      }
+      const cats = [...byCat.keys()];
+
+      const anyCatSet = cats.some((c) => Number(alloc[c]) > 0);
+      const anyScopeSet = items.some((s) => Number(s.allocationPct) > 0);
+      if (!anyCatSet && !anyScopeSet) continue; // allocation not used here
+
+      const where = cfg.propertyType ? `${label} · ${cfg.propertyType}` : label;
+
+      // Rule 1 — category allocation must total exactly 100%.
+      const catSum = Math.round(
+        cats.reduce((sum, c) => sum + (Number(alloc[c]) || 0), 0),
+      );
+      if (catSum !== 100) {
+        issues.push(
+          `Category allocation for "${where}" totals ${catSum}% — it must equal 100%.`,
+        );
+      }
+
+      // Rule 2 — scope allocation within each started category must total 100%.
+      for (const [cat, rows] of byCat) {
+        if (!rows.some((s) => Number(s.allocationPct) > 0)) continue;
+        const scopeSum = Math.round(
+          rows.reduce((sum, s) => sum + (Number(s.allocationPct) || 0), 0),
+        );
+        if (scopeSum !== 100) {
+          issues.push(
+            `Scope allocation for "${cat}" in "${where}" totals ${scopeSum}% — it must equal 100%.`,
+          );
+        }
+      }
+    }
+  }
+  return issues;
+};
+
+// Scale a size-range string by a factor, preserving its range/open-ended shape.
+//   "800-1100" ×1.1 -> "880-1210"   "2400+" ×0.9 -> "2160+"   "300" ×1.1 -> "330"
+const scaleSizeRange = (sizeRange, factor) => {
+  const cleaned = cleanSizeRange(sizeRange || "");
+  const nums = (cleaned.match(/\d+/g) || []).map(Number).filter((n) => n > 0);
+  if (!nums.length || !(factor > 0)) return sizeRange;
+  const scaled = nums.map((n) => Math.max(1, Math.round(n * factor)));
+  const openEnded = /\+/.test(sizeRange || "");
+  if (scaled.length === 1) {
+    return openEnded ? `${scaled[0]}+` : String(scaled[0]);
+  }
+  const min = Math.min(...scaled);
+  const max = Math.max(...scaled);
+  return `${min}-${max}`;
+};
+
+// Redistribute percentages so they total 100% while holding `fixedKey` at its
+// current value. The remaining budget is split across the OTHER entries in
+// proportion to their current values (evenly when they're all zero). Returns a
+// { [key]: pct } map of whole-number percentages that sums to exactly 100.
+// Percentages are only changed for the non-fixed entries.
+const redistributeAllocation = (entries, fixedKey) => {
+  const result = {};
+  const fixed = entries.find((e) => e.key === fixedKey) || entries[0];
+  if (!fixed) return result;
+  const fixedPct = Math.min(100, Math.max(0, Number(fixed.pct) || 0));
+  const others = entries.filter((e) => e.key !== fixed.key);
+  if (others.length === 0) {
+    result[fixed.key] = 100;
+    return result;
+  }
+  const remaining = Math.max(0, 100 - fixedPct);
+  const otherSum = others.reduce((a, e) => a + (Number(e.pct) || 0), 0);
+  result[fixed.key] = fixedPct;
+  others.forEach((e) => {
+    result[e.key] =
+      otherSum > 0
+        ? ((Number(e.pct) || 0) / otherSum) * remaining
+        : remaining / others.length;
+  });
+  // Round to whole numbers, then patch any rounding remainder onto the largest
+  // OTHER entry so the fixed value is never touched and the sum is exactly 100.
+  let sum = 0;
+  for (const k of Object.keys(result)) {
+    result[k] = Math.round(result[k]);
+    sum += result[k];
+  }
+  const diff = 100 - sum;
+  if (diff !== 0) {
+    let bestKey = others[0].key;
+    for (const e of others) if (result[e.key] > result[bestKey]) bestKey = e.key;
+    result[bestKey] += diff;
+  }
+  return result;
+};
+
 const ProposalMaster = () => {
   const [master, setMaster] = useState(() => getMaster());
   const [hasChanges, setHasChanges] = useState(false);
@@ -194,6 +316,14 @@ const ProposalMaster = () => {
   const [editingScopeIdx, setEditingScopeIdx] = useState(null);
   // Detailed read-only preview of the whole preset, grouped by room.
   const [previewOpen, setPreviewOpen] = useState(false);
+  // Dynamic Estimation Engine preview — open state + transient what-if sq.ft.
+  // The sqft override is never saved; it just scales the live estimate.
+  const [estimateOpen, setEstimateOpen] = useState(false);
+  const [estimateSqft, setEstimateSqft] = useState("");
+  // Allocation adjustment modal — opened when a category's scope total or the
+  // category total drifts off 100%. Shape: { level, category?, editedIdx?,
+  // editedKey? }. Percentages are only changed when the user applies an option.
+  const [adjustModal, setAdjustModal] = useState(null);
   // Whether the Add Type modal is open.
   const [addTypeModalOpen, setAddTypeModalOpen] = useState(false);
   // Preserved configs for unchecked property types. Keyed by
@@ -546,6 +676,116 @@ const ProposalMaster = () => {
     showToast("Scope item removed", "info");
   };
 
+  // ── Allocation configuration ─────────────────────────────────────────────
+  // Category Allocation (%) is stored per configuration on `categoryAllocations`
+  // keyed by the canonical category (the scope row's `area`). Scope Allocation
+  // (%) within a category is stored on each scope item as `allocationPct`. Both
+  // reuse the existing scope data — no separate Scope Mapping Master.
+  const clampPct = (value) => {
+    if (value === "" || value == null) return "";
+    const n = Number(value);
+    if (Number.isNaN(n)) return "";
+    return Math.max(0, Math.min(100, n));
+  };
+
+  const setCategoryAllocation = (category, value) => {
+    const pct = clampPct(value);
+    setConfigField((cfg) => ({
+      ...cfg,
+      categoryAllocations: {
+        ...(cfg.categoryAllocations || {}),
+        [category]: pct,
+      },
+    }));
+  };
+
+  const setScopeAllocation = (idx, value) => {
+    const pct = clampPct(value);
+    setConfigField((cfg) => ({
+      ...cfg,
+      scopeItems: cfg.scopeItems.map((s, i) =>
+        i === idx ? { ...s, allocationPct: pct } : s,
+      ),
+    }));
+  };
+
+  // Edit the Scope Quantity directly — back-calculate the Scope % it implies
+  // (Scope % = Qty ÷ Category Sq.ft × 100) and store that. Scope % stays the
+  // single source of truth; the quantity itself is never stored. Editing the
+  // quantity needs a Standard Sq.ft and a Category % so a Category Sq.ft exists.
+  const setScopeAllocationFromQty = (idx, category, qtyValue) => {
+    const standardSqft = getStandardSqft(activeConfig?.sizeRange);
+    const catPct = Number(activeConfig?.categoryAllocations?.[category]) || 0;
+    const categorySqft = getCategorySqft(standardSqft, catPct);
+    if (categorySqft <= 0) {
+      showToast(
+        "Set a Sq.ft range and Category % before editing quantity",
+        "error",
+      );
+      return;
+    }
+    const qty = Math.max(0, Number(qtyValue) || 0);
+    // Keep two decimals so the % → Qty round-trip stays stable.
+    const pct = Math.round((qty / categorySqft) * 100 * 100) / 100;
+    setScopeAllocation(idx, pct);
+  };
+
+  // One-click: derive every category % and scope % from the current ₹ amounts.
+  // Category % = category total / subtotal; Scope % = item amount / its category.
+  const autoDistributeAllocations = () => {
+    const items = activeConfig?.scopeItems || [];
+    const subtotal = items.reduce((s, it) => s + (Number(it.amount) || 0), 0);
+    if (!subtotal) {
+      showToast("Set scope amounts first to derive allocation", "error");
+      return;
+    }
+    const catTotals = {};
+    for (const s of items) {
+      const cat = s.area || "Unassigned";
+      catTotals[cat] = (catTotals[cat] || 0) + (Number(s.amount) || 0);
+    }
+    setConfigField((cfg) => {
+      const categoryAllocations = {};
+      for (const cat of Object.keys(catTotals)) {
+        categoryAllocations[cat] = Math.round((catTotals[cat] / subtotal) * 100);
+      }
+      return {
+        ...cfg,
+        categoryAllocations,
+        scopeItems: (cfg.scopeItems || []).map((s) => {
+          const cat = s.area || "Unassigned";
+          const ct = catTotals[cat] || 0;
+          const pct = ct > 0 ? Math.round(((Number(s.amount) || 0) / ct) * 100) : 0;
+          return { ...s, allocationPct: pct };
+        }),
+      };
+    });
+    showToast("Allocation derived from amounts", "success");
+  };
+
+  // Reset every category & scope % for the active configuration back to blank.
+  const clearAllocations = () => {
+    setConfigField((cfg) => ({
+      ...cfg,
+      categoryAllocations: {},
+      scopeItems: (cfg.scopeItems || []).map((s) => {
+        const next = { ...s };
+        delete next.allocationPct;
+        return next;
+      }),
+    }));
+    showToast("Allocation cleared", "info");
+  };
+
+  // Open the Dynamic Estimation Engine preview. Persist first so the engine —
+  // which reads Proposal Master as the single source of truth — sees the latest
+  // edits, then seed the what-if field with the preset's own Sq.ft.
+  const openEstimate = () => {
+    saveMaster(master);
+    setEstimateSqft(String(parsePresetArea(activeConfig?.sizeRange) || ""));
+    setEstimateOpen(true);
+  };
+
   const updateMaterial = (scopeIdx, matIdx, key, value) => {
     setConfigField((cfg) => ({
       ...cfg,
@@ -702,6 +942,31 @@ const ProposalMaster = () => {
       setSizeRangeError(err);
       return;
     }
+    // Block the save when any started allocation doesn't total exactly 100%.
+    const allocationIssues = collectAllocationIssues(master);
+    if (allocationIssues.length > 0) {
+      // If the imbalance is in the active config, open the adjustment modal so
+      // the user can resolve it; otherwise just point them at the offender.
+      const unbalancedScopeCat = allocationView.cats.find(
+        (c) => c.scopeStarted && c.scopeSum !== 100,
+      );
+      if (!allocationView.catValid && allocationView.inMode) {
+        setAdjustModal({
+          level: "category",
+          editedKey: allocationView.cats[allocationView.cats.length - 1]?.room,
+        });
+      } else if (unbalancedScopeCat) {
+        setAdjustModal({
+          level: "scope",
+          category: unbalancedScopeCat.room,
+          editedIdx:
+            unbalancedScopeCat.rows[unbalancedScopeCat.rows.length - 1]?.idx,
+        });
+      } else {
+        showToast(allocationIssues[0], "error");
+      }
+      return;
+    }
     saveMaster(master);
     setHasChanges(false);
     setSavedFlash(true);
@@ -793,6 +1058,210 @@ const ProposalMaster = () => {
     return groups;
   }, [sortedScope]);
 
+  // Allocation view-model for the active configuration: each category carries
+  // its Category %, its Scope % running sum, and the Remaining (100 − total) for
+  // both, so the UI can show Current Total + Remaining and flag any total ≠ 100.
+  const allocationView = useMemo(() => {
+    const allocations = activeConfig?.categoryAllocations || {};
+    // Standard Sq.ft drives the live quantities shown in the allocation editor.
+    const standardSqft = getStandardSqft(activeConfig?.sizeRange);
+    const cats = groupedScope.map((g) => {
+      const raw = allocations[g.room];
+      const catPct = raw === "" || raw == null ? "" : Number(raw);
+      const categorySqft = Math.round(
+        getCategorySqft(standardSqft, Number(catPct) || 0),
+      );
+      const scopeStarted = g.rows.some(
+        ({ item }) => Number(item.allocationPct) > 0,
+      );
+      const scopeSum = Math.round(
+        g.rows.reduce((s, { item }) => s + (Number(item.allocationPct) || 0), 0),
+      );
+      return {
+        room: g.room,
+        rows: g.rows,
+        catPct,
+        categorySqft,
+        scopeSum,
+        scopeStarted,
+        scopeRemaining: 100 - scopeSum,
+      };
+    });
+    const catSum = Math.round(
+      cats.reduce((s, c) => s + (Number(c.catPct) || 0), 0),
+    );
+    const anyCatSet = cats.some((c) => c.catPct !== "" && Number(c.catPct) > 0);
+    const anyScopeSet = cats.some((c) => c.scopeStarted);
+    return {
+      cats,
+      catSum,
+      catRemaining: 100 - catSum,
+      catValid: catSum === 100,
+      inMode: anyCatSet || anyScopeSet,
+      standardSqft,
+    };
+  }, [groupedScope, activeConfig]);
+
+  // View-model for the allocation adjustment modal (active config only).
+  const adjustData = useMemo(() => {
+    if (!adjustModal) return null;
+    const standardSqft = allocationView.standardSqft;
+    const sizeRange = activeConfig?.sizeRange || "";
+    if (adjustModal.level === "scope") {
+      const cat = allocationView.cats.find(
+        (c) => c.room === adjustModal.category,
+      );
+      if (!cat) return null;
+      const scopes = cat.rows.map(({ item, idx }) => {
+        const pct = Number(item.allocationPct) || 0;
+        return {
+          idx,
+          name:
+            namedOriginalItems[idx]?._displayCategory ||
+            item.itemName ||
+            item.description ||
+            "Untitled scope",
+          pct,
+          qty: Math.round(getScopeQuantity(cat.categorySqft, pct)),
+        };
+      });
+      return {
+        level: "scope",
+        category: cat.room,
+        editedIdx: adjustModal.editedIdx,
+        standardSqft,
+        sizeRange,
+        categoryPct: Number(cat.catPct) || 0,
+        categorySqft: cat.categorySqft,
+        scopes,
+        total: cat.scopeSum,
+        remaining: 100 - cat.scopeSum,
+      };
+    }
+    const categories = allocationView.cats.map((c) => ({
+      room: c.room,
+      pct: Number(c.catPct) || 0,
+      qty: c.categorySqft,
+    }));
+    return {
+      level: "category",
+      editedKey: adjustModal.editedKey,
+      standardSqft,
+      sizeRange,
+      categories,
+      total: allocationView.catSum,
+      remaining: 100 - allocationView.catSum,
+    };
+  }, [adjustModal, allocationView, activeConfig, namedOriginalItems]);
+
+  // Option 1 — Adjust overall Property Preset Sq.ft: rescale the preset size by
+  // the over/under factor and normalise the offending category (or all
+  // categories) to 100%, preserving the quantities the user entered.
+  const applyAdjustSqft = () => {
+    if (!adjustData || !(adjustData.total > 0)) {
+      setAdjustModal(null);
+      return;
+    }
+    const T = adjustData.total;
+    const factor = T / 100;
+    const newSizeRange = scaleSizeRange(adjustData.sizeRange, factor);
+    const norm = (pct) => Math.round(((Number(pct) || 0) * 100) / T * 100) / 100;
+    if (adjustData.level === "scope") {
+      const cat = adjustData.category;
+      setConfigField((cfg) => ({
+        ...cfg,
+        sizeRange: newSizeRange,
+        scopeItems: cfg.scopeItems.map((s) =>
+          (s.area || "Unassigned") === cat
+            ? { ...s, allocationPct: norm(s.allocationPct) }
+            : s,
+        ),
+      }));
+    } else {
+      setConfigField((cfg) => {
+        const alloc = { ...(cfg.categoryAllocations || {}) };
+        for (const k of Object.keys(alloc)) alloc[k] = norm(alloc[k]);
+        return { ...cfg, sizeRange: newSizeRange, categoryAllocations: alloc };
+      });
+    }
+    showToast(
+      `Preset resized to ${getStandardSqft(newSizeRange).toLocaleString("en-IN")} sqft · normalised to 100%`,
+      "success",
+    );
+    setAdjustModal(null);
+  };
+
+  // Option 2 — Redistribute across the other scopes (or categories): hold the
+  // edited entry fixed and rebalance the rest to total 100%. Sq.ft is unchanged.
+  const applyRedistribute = () => {
+    if (!adjustData) return;
+    if (adjustData.level === "scope") {
+      const cat = adjustData.category;
+      const entries = adjustData.scopes.map((s) => ({ key: s.idx, pct: s.pct }));
+      const fixedKey =
+        adjustData.editedIdx != null ? adjustData.editedIdx : entries[0]?.key;
+      const next = redistributeAllocation(entries, fixedKey);
+      setConfigField((cfg) => ({
+        ...cfg,
+        scopeItems: cfg.scopeItems.map((s, i) =>
+          (s.area || "Unassigned") === cat && next[i] != null
+            ? { ...s, allocationPct: next[i] }
+            : s,
+        ),
+      }));
+    } else {
+      const entries = adjustData.categories.map((c) => ({
+        key: c.room,
+        pct: c.pct,
+      }));
+      const fixedKey = adjustData.editedKey || entries[0]?.key;
+      const next = redistributeAllocation(entries, fixedKey);
+      setConfigField((cfg) => {
+        const alloc = { ...(cfg.categoryAllocations || {}) };
+        for (const room of Object.keys(next)) alloc[room] = next[room];
+        return { ...cfg, categoryAllocations: alloc };
+      });
+    }
+    showToast("Redistributed to total 100%", "success");
+    setAdjustModal(null);
+  };
+
+  // Open the adjustment modal when the just-edited category's scope total ≠ 100%.
+  const maybeAdjustScope = (idx, category) => {
+    const cat = allocationView.cats.find((c) => c.room === category);
+    if (cat && cat.scopeStarted && cat.scopeSum !== 100) {
+      setAdjustModal({ level: "scope", category, editedIdx: idx });
+    }
+  };
+  // Open the adjustment modal when the category total ≠ 100%.
+  const maybeAdjustCategory = (room) => {
+    if (allocationView.inMode && allocationView.catSum !== 100) {
+      setAdjustModal({ level: "category", editedKey: room });
+    }
+  };
+  // Defer the imbalance check until focus settles — skip if the user simply
+  // tabbed to another number input (i.e. is still actively distributing).
+  const commitAllocCheck = (opener) => {
+    setTimeout(() => {
+      const ae = document.activeElement;
+      if (ae && ae.tagName === "INPUT" && ae.type === "number") return;
+      opener();
+    }, 0);
+  };
+
+  // Live result of the Dynamic Estimation Engine for the preview modal. Derived
+  // from Proposal Master (Sq.ft × Category % × Scope %); nothing is stored here.
+  const estimateResult = useMemo(() => {
+    if (!estimateOpen || !active) return null;
+    const sqftNum = Number(estimateSqft);
+    return estimateScopeQuantities(
+      activeKey,
+      activeConfig?.propertyType,
+      sqftNum > 0 ? { sqft: sqftNum } : {},
+    );
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [estimateOpen, estimateSqft, activeKey, activeConfig?.propertyType, master]);
+
   if (!active) {
     return (
       <div className="p-8 text-text-muted text-sm">No preset selected.</div>
@@ -801,6 +1270,9 @@ const ProposalMaster = () => {
 
   const scopeItems = activeConfig?.scopeItems || [];
   const totals = computeTotals(scopeItems);
+  // Any allocation total ≠ 100% (across all presets) blocks the explicit save.
+  const allocationIssues = collectAllocationIssues(master);
+  const allocationBlocked = allocationIssues.length > 0;
   const maxScope = Math.max(1, ...scopeItems.map((s) => Number(s.amount) || 0));
   // Cost split — materials vs labour vs margin — aggregated from each scope
   // item's rate build-up (via its linked Item Master recipe). Items without a
@@ -864,6 +1336,14 @@ const ProposalMaster = () => {
               <Keyboard size={12} />
             </button>
 
+            {allocationBlocked && (
+              <span
+                title={allocationIssues[0]}
+                className="hidden sm:flex items-center gap-1 px-2.5 py-2 rounded-lg bg-amber-50 border border-amber-200 text-[11px] font-semibold text-amber-700"
+              >
+                <AlertTriangle size={12} /> Allocation ≠ 100%
+              </span>
+            )}
             <button
               type="button"
               onClick={handleReset}
@@ -874,11 +1354,18 @@ const ProposalMaster = () => {
             <button
               type="button"
               onClick={handleManualSave}
+              title={
+                allocationBlocked
+                  ? allocationIssues[0]
+                  : "Save all changes"
+              }
               className={`flex items-center gap-1.5 px-4 py-2 cursor-pointer rounded-lg text-[12px] font-semibold transition-all shadow-md ${
                 savedFlash
                   ? "bg-emerald-500 text-white shadow-emerald-500/20"
-                  : "bg-linear-to-br from-select-blue to-primary text-white hover:shadow-select-blue/30 hover:scale-[1.02]"
-              } ${hasChanges && !savedFlash ? "animate-pulse ring-2 ring-select-blue/20" : ""}`}
+                  : allocationBlocked
+                    ? "bg-linear-to-br from-amber-500 to-amber-600 text-white hover:shadow-amber-500/30"
+                    : "bg-linear-to-br from-select-blue to-primary text-white hover:shadow-select-blue/30 hover:scale-[1.02]"
+              } ${hasChanges && !savedFlash && !allocationBlocked ? "animate-pulse ring-2 ring-select-blue/20" : ""}`}
             >
               {savedFlash ? <Check size={13} /> : <Save size={13} />}
               {savedFlash ? "Saved" : "Save Changes"}
@@ -1675,6 +2162,343 @@ const ProposalMaster = () => {
                 )}
               </div>
             </section>
+
+            {/* ── Budget Allocation ─────────────────────────────────────── */}
+            <section className="bg-white rounded-2xl border border-bordergray shadow-[0_1px_3px_rgba(15,23,42,0.04)] overflow-hidden">
+              <div className="px-5 py-4 border-b border-bordergray flex items-center justify-between flex-wrap gap-2">
+                <div className="flex items-center gap-2">
+                  <div className="h-7 w-7 rounded-lg bg-select-blue/10 text-select-blue flex items-center justify-center">
+                    <PieChart size={13} />
+                  </div>
+                  <div>
+                    <h2 className="text-[13px] font-bold text-textcolor">
+                      Budget Allocation
+                    </h2>
+                    <p className="text-[10.5px] text-text-muted">
+                      {allocationView.standardSqft > 0
+                        ? `Standard ${allocationView.standardSqft.toLocaleString("en-IN")} sqft · edit Scope % or Qty — each updates the other`
+                        : "Set a Sq.ft range to compute quantities · edit Scope %"}
+                    </p>
+                  </div>
+                </div>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={openEstimate}
+                    disabled={scopeItems.length === 0}
+                    title="Estimate scope quantities from Sq.ft × Category % × Scope %"
+                    className="flex items-center gap-1 px-3 py-1.5 rounded-lg bg-linear-to-br from-select-blue to-primary text-white text-[11px] font-semibold hover:shadow-md hover:shadow-select-blue/20 shadow-sm transition-all disabled:opacity-40 disabled:cursor-not-allowed"
+                  >
+                    <Ruler size={12} /> Estimate
+                  </button>
+                  <button
+                    type="button"
+                    onClick={autoDistributeAllocations}
+                    disabled={scopeItems.length === 0}
+                    title="Derive every category & scope % from the current ₹ amounts"
+                    className="flex items-center gap-1 px-3 py-1.5 rounded-lg border border-select-blue/30 bg-select-blue/5 text-[11px] font-semibold text-select-blue hover:bg-select-blue/10 transition-all disabled:opacity-40 disabled:cursor-not-allowed"
+                  >
+                    <Scale size={12} /> Derive from amounts
+                  </button>
+                  <button
+                    type="button"
+                    onClick={clearAllocations}
+                    disabled={scopeItems.length === 0}
+                    className="flex items-center gap-1 px-3 py-1.5 rounded-lg border border-bordergray bg-white text-[11px] font-semibold text-text-muted hover:bg-bg-soft hover:text-textcolor transition-all disabled:opacity-40 disabled:cursor-not-allowed"
+                  >
+                    <RotateCcw size={12} /> Clear
+                  </button>
+                </div>
+              </div>
+
+              {scopeItems.length === 0 ? (
+                <div className="p-4">
+                  <div className="text-center py-10 px-6 rounded-xl border border-dashed border-bordergray bg-linear-to-br from-bg-soft/60 to-active-bg/30">
+                    <div className="h-12 w-12 rounded-2xl bg-white border border-bordergray flex items-center justify-center mx-auto mb-3 shadow-sm">
+                      <Percent size={18} className="text-select-blue" />
+                    </div>
+                    <p className="text-[13px] font-bold text-textcolor">
+                      Nothing to allocate yet
+                    </p>
+                    <p className="text-[11px] text-text-muted mt-1 max-w-xs mx-auto">
+                      Add scope items above first — categories and scopes are
+                      pulled from your Scope of Work.
+                    </p>
+                  </div>
+                </div>
+              ) : (
+                <div className="p-4 space-y-4">
+                  {/* Category allocation — Current Total + Remaining */}
+                  {(() => {
+                    const { catSum, catRemaining, catValid } = allocationView;
+                    const over = catRemaining < 0;
+                    return (
+                      <div
+                        className={`rounded-lg border px-3 py-2.5 ${
+                          catValid
+                            ? "border-emerald-200 bg-emerald-50/60"
+                            : "border-amber-200 bg-amber-50/60"
+                        }`}
+                      >
+                        <div className="flex items-center justify-between mb-2">
+                          <span className="flex items-center gap-1.5 text-[11px] font-semibold text-textcolor">
+                            <PieChart size={12} className="text-select-blue" />
+                            Category allocation
+                          </span>
+                          {catValid ? (
+                            <span className="flex items-center gap-1 text-[10px] font-bold uppercase tracking-wider text-emerald-600">
+                              <CheckCircle2 size={11} /> Balanced
+                            </span>
+                          ) : (
+                            <span className="flex items-center gap-1 text-[10px] font-bold uppercase tracking-wider text-amber-600">
+                              <AlertTriangle size={11} />{" "}
+                              {over ? "Over-allocated" : "Incomplete"}
+                            </span>
+                          )}
+                        </div>
+                        <div className="grid grid-cols-2 gap-2 mb-2">
+                          <div className="rounded-md bg-white border border-bordergray px-2.5 py-1.5">
+                            <p className="text-[9px] font-bold uppercase tracking-wider text-text-subtle">
+                              Current Total
+                            </p>
+                            <p
+                              className={`text-[14px] font-bold tabular-nums ${
+                                catValid ? "text-emerald-600" : "text-textcolor"
+                              }`}
+                            >
+                              {catSum}%
+                            </p>
+                          </div>
+                          <div className="rounded-md bg-white border border-bordergray px-2.5 py-1.5">
+                            <p className="text-[9px] font-bold uppercase tracking-wider text-text-subtle">
+                              Remaining
+                            </p>
+                            <p
+                              className={`text-[14px] font-bold tabular-nums ${
+                                over
+                                  ? "text-red-500"
+                                  : catValid
+                                    ? "text-emerald-600"
+                                    : "text-amber-600"
+                              }`}
+                            >
+                              {catRemaining}%
+                            </p>
+                          </div>
+                        </div>
+                        <div className="h-1.5 w-full bg-white rounded-full overflow-hidden border border-bordergray">
+                          <div
+                            className={`h-full transition-all ${
+                              over
+                                ? "bg-red-500"
+                                : catValid
+                                  ? "bg-emerald-500"
+                                  : "bg-amber-500"
+                            }`}
+                            style={{
+                              width: `${Math.min(100, Math.max(0, catSum))}%`,
+                            }}
+                          />
+                        </div>
+                        {!catValid && (
+                          <div className="mt-1.5 flex items-center justify-between gap-2">
+                            <p className="text-[10px] text-amber-700">
+                              {over
+                                ? `Over by ${Math.abs(catRemaining)}% — reduce category percentages to total 100%.`
+                                : `Add ${catRemaining}% more to reach 100%. Saving is blocked until categories total 100%.`}
+                            </p>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setAdjustModal({
+                                  level: "category",
+                                  editedKey:
+                                    allocationView.cats[
+                                      allocationView.cats.length - 1
+                                    ]?.room,
+                                })
+                              }
+                              className="flex items-center gap-1 px-2 py-0.5 rounded-md bg-amber-500 text-white text-[10px] font-semibold hover:bg-amber-600 transition-colors shrink-0"
+                            >
+                              <Scale size={10} /> Balance
+                            </button>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })()}
+
+                  {allocationView.cats.map((cat) => {
+                    const gcat = getCategory(cat.room);
+                    const gc = COLOR_MAP[gcat.color];
+                    const scopeBalanced = cat.scopeSum === 100;
+                    return (
+                      <div
+                        key={cat.room}
+                        className="rounded-xl border border-bordergray overflow-hidden"
+                      >
+                        {/* Category header — Category Allocation (%) */}
+                        <div className="flex items-center justify-between gap-3 px-3 py-2.5 bg-bg-soft/50 border-b border-bordergray">
+                          <div className="flex items-center gap-2 min-w-0">
+                            <span
+                              className={`h-2.5 w-2.5 rounded-full shrink-0 ${gc.dot}`}
+                            />
+                            <h4 className="text-[12px] font-bold text-textcolor uppercase tracking-wide truncate">
+                              {cat.room}
+                            </h4>
+                            <span className="text-[10px] font-semibold text-text-muted bg-white px-1.5 py-0.5 rounded-md border border-bordergray">
+                              {cat.rows.length}
+                            </span>
+                            {cat.categorySqft > 0 && (
+                              <span
+                                className="text-[10px] font-semibold text-select-blue bg-active-bg/60 px-1.5 py-0.5 rounded-md"
+                                title="Category Sq.ft = Standard Sq.ft × Category %"
+                              >
+                                {cat.categorySqft.toLocaleString("en-IN")} sqft
+                              </span>
+                            )}
+                          </div>
+                          <div className="flex items-center gap-2 shrink-0">
+                            <span className="text-[10px] font-semibold uppercase tracking-wider text-text-muted">
+                              Category
+                            </span>
+                            <PctInput
+                              value={cat.catPct}
+                              onChange={(v) =>
+                                setCategoryAllocation(cat.room, v)
+                              }
+                              onCommit={() =>
+                                commitAllocCheck(() =>
+                                  maybeAdjustCategory(cat.room),
+                                )
+                              }
+                            />
+                          </div>
+                        </div>
+
+                        {/* Scope rows — editable Scope Quantity ⇄ Scope % */}
+                        <div className="divide-y divide-bordergray">
+                          {cat.rows.map(({ item, idx }) => {
+                            const scopePct = Number(item.allocationPct) || 0;
+                            const scopeQty = Math.round(
+                              getScopeQuantity(cat.categorySqft, scopePct),
+                            );
+                            return (
+                              <div
+                                key={idx}
+                                className="flex items-center justify-between gap-3 px-3 py-2"
+                              >
+                                <span className="text-[12px] text-textcolor truncate min-w-0">
+                                  {namedOriginalItems[idx]?._displayCategory ||
+                                    item.itemName ||
+                                    item.description || (
+                                      <span className="italic text-text-subtle">
+                                        Untitled scope
+                                      </span>
+                                    )}
+                                </span>
+                                <div className="flex items-center gap-3 shrink-0">
+                                  <div className="flex items-center gap-1.5">
+                                    <span className="text-[10px] font-semibold uppercase tracking-wider text-text-subtle">
+                                      Qty
+                                    </span>
+                                    <QtyInput
+                                      value={scopeQty}
+                                      disabled={cat.categorySqft <= 0}
+                                      onChange={(v) =>
+                                        setScopeAllocationFromQty(
+                                          idx,
+                                          cat.room,
+                                          v,
+                                        )
+                                      }
+                                      onCommit={() =>
+                                        commitAllocCheck(() =>
+                                          maybeAdjustScope(idx, cat.room),
+                                        )
+                                      }
+                                    />
+                                  </div>
+                                  <div className="flex items-center gap-1.5">
+                                    <span className="text-[10px] font-semibold uppercase tracking-wider text-text-subtle">
+                                      Scope
+                                    </span>
+                                    <PctInput
+                                      value={item.allocationPct}
+                                      onChange={(v) => setScopeAllocation(idx, v)}
+                                      onCommit={() =>
+                                        commitAllocCheck(() =>
+                                          maybeAdjustScope(idx, cat.room),
+                                        )
+                                      }
+                                    />
+                                  </div>
+                                </div>
+                              </div>
+                            );
+                          })}
+                          {/* Scope total for this category — Current + Remaining */}
+                          <div className="flex items-center justify-between px-3 py-1.5 bg-bg-soft/30">
+                            <span className="text-[10.5px] font-semibold text-text-muted">
+                              Scope total
+                            </span>
+                            {cat.scopeStarted ? (
+                              <span className="flex items-center gap-2">
+                                <span
+                                  className={`text-[10.5px] font-bold tabular-nums ${
+                                    scopeBalanced
+                                      ? "text-emerald-600"
+                                      : "text-amber-600"
+                                  }`}
+                                >
+                                  {cat.scopeSum}%
+                                </span>
+                                <span className="text-[10px] text-text-subtle">
+                                  ·
+                                </span>
+                                <span
+                                  className={`text-[10px] font-semibold tabular-nums ${
+                                    cat.scopeRemaining < 0
+                                      ? "text-red-500"
+                                      : scopeBalanced
+                                        ? "text-emerald-600"
+                                        : "text-amber-600"
+                                  }`}
+                                >
+                                  {cat.scopeRemaining < 0
+                                    ? `${Math.abs(cat.scopeRemaining)}% over`
+                                    : `${cat.scopeRemaining}% left`}
+                                </span>
+                                {!scopeBalanced && (
+                                  <button
+                                    type="button"
+                                    onClick={() =>
+                                      setAdjustModal({
+                                        level: "scope",
+                                        category: cat.room,
+                                        editedIdx: cat.rows[cat.rows.length - 1]
+                                          ?.idx,
+                                      })
+                                    }
+                                    className="flex items-center gap-1 px-2 py-0.5 rounded-md bg-amber-500 text-white text-[10px] font-semibold hover:bg-amber-600 transition-colors"
+                                  >
+                                    <Scale size={10} /> Balance
+                                  </button>
+                                )}
+                              </span>
+                            ) : (
+                              <span className="text-[10px] text-text-subtle">
+                                Not allocated
+                              </span>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </section>
           </main>
 
           {/* ── Right: Stats + Inclusions / Exclusions ──────────────────── */}
@@ -2036,7 +2860,427 @@ const ProposalMaster = () => {
           </div>
         </Modal>
       )}
+
+      {/* ── Dynamic Estimation Engine preview ──────────────────────────── */}
+      {estimateOpen && (
+        <EstimationModal
+          presetKey={activeKey}
+          propertyType={activeConfig?.propertyType || ""}
+          result={estimateResult}
+          sqft={estimateSqft}
+          onSqftChange={setEstimateSqft}
+          onResetSqft={() =>
+            setEstimateSqft(String(parsePresetArea(activeConfig?.sizeRange) || ""))
+          }
+          presetSqft={parsePresetArea(activeConfig?.sizeRange)}
+          onClose={() => setEstimateOpen(false)}
+        />
+      )}
+
+      {/* ── Allocation adjustment modal ────────────────────────────────── */}
+      {adjustModal && adjustData && (
+        <AllocationAdjustModal
+          data={adjustData}
+          onAdjustSqft={applyAdjustSqft}
+          onRedistribute={applyRedistribute}
+          onClose={() => setAdjustModal(null)}
+        />
+      )}
     </div>
+  );
+};
+
+// ───────────────────────────────────────────────────────────────────────────
+// Estimation Modal — read-only preview of the Dynamic Estimation Engine.
+// Quantities are DERIVED live (Sq.ft × Category % × Scope %); nothing here is
+// persisted, and no allocation values are copied out of Proposal Master.
+// ───────────────────────────────────────────────────────────────────────────
+
+const EstimationModal = ({
+  presetKey,
+  propertyType,
+  result,
+  sqft,
+  onSqftChange,
+  onResetSqft,
+  presetSqft,
+  onClose,
+}) => {
+  const overridden = Number(sqft) > 0 && Number(sqft) !== presetSqft;
+  return (
+    <Modal
+      title="Dynamic Estimation"
+      subtitle={`${presetKey}${propertyType ? ` · ${propertyType}` : ""} — Sq.ft × Category % × Scope %`}
+      onClose={onClose}
+      maxWidth="max-w-[720px]"
+      footer={
+        <div className="flex items-center justify-between w-full gap-4">
+          <span className="text-[11px] text-text-muted">
+            Derived live from Proposal Master · not stored
+          </span>
+          <div className="flex items-center gap-6 text-[13px]">
+            <span className="text-text-muted">
+              Allocated area:{" "}
+              <span className="font-semibold text-textcolor tabular-nums">
+                {(result?.allocatedArea || 0).toLocaleString("en-IN")} sqft
+              </span>
+            </span>
+            {result?.totalAmount > 0 && (
+              <span className="text-[15px] font-bold text-primary tabular-nums">
+                {formatAmount(result.totalAmount)}
+              </span>
+            )}
+          </div>
+        </div>
+      }
+    >
+      {/* Base area control */}
+      <div className="mb-4 rounded-xl border border-bordergray bg-bg-soft/50 p-3">
+        <div className="flex items-center justify-between gap-3 flex-wrap">
+          <div>
+            <label className="flex items-center gap-1 text-[10.5px] font-semibold uppercase tracking-wider text-text-muted mb-1.5">
+              <Ruler size={11} className="text-select-blue" /> Estimation Sq.ft
+            </label>
+            <div className="flex items-center gap-2">
+              <div className="relative w-32">
+                <input
+                  type="number"
+                  min={0}
+                  value={sqft}
+                  onChange={(e) => onSqftChange(e.target.value)}
+                  placeholder={String(presetSqft || 0)}
+                  className={`${inputBase} pr-12 tabular-nums font-semibold`}
+                />
+                <span className="absolute right-3 top-1/2 -translate-y-1/2 text-[10px] font-bold text-text-subtle pointer-events-none uppercase">
+                  Sq Ft
+                </span>
+              </div>
+              {overridden && (
+                <button
+                  type="button"
+                  onClick={onResetSqft}
+                  className="flex items-center gap-1 px-2.5 py-2 rounded-lg border border-bordergray bg-white text-[11px] font-semibold text-text-muted hover:bg-bg-soft"
+                  title={`Reset to standard Sq.ft (${presetSqft})`}
+                >
+                  <RotateCcw size={12} /> Standard
+                </button>
+              )}
+            </div>
+          </div>
+          <p className="text-[10.5px] text-text-muted max-w-[260px]">
+            Standard Sq.ft is{" "}
+            <span className="font-semibold text-textcolor">{presetSqft}</span>{" "}
+            (average of the preset range). Enter an actual built-up area to scale
+            the estimate — this is a what-if only and is never saved.
+          </p>
+        </div>
+      </div>
+
+      {!result || result.categories.length === 0 ? (
+        <p className="text-[12px] text-text-muted text-center py-8">
+          No scope items to estimate.
+        </p>
+      ) : (
+        <div className="space-y-5">
+          {result.categories.map((cat) => {
+            const gcat = getCategory(cat.category);
+            const gc = COLOR_MAP[gcat.color];
+            return (
+              <div key={cat.category}>
+                <div className="flex items-center justify-between border-b border-bordergray pb-2 mb-2">
+                  <div className="flex items-center gap-2 min-w-0">
+                    <span className={`h-2.5 w-2.5 rounded-full ${gc.dot}`} />
+                    <h3 className="text-[13px] font-bold text-textcolor uppercase tracking-wide truncate">
+                      {cat.category}
+                    </h3>
+                    <span className="text-[10px] font-semibold text-text-muted bg-bg-soft px-1.5 py-0.5 rounded-md border border-bordergray">
+                      {cat.categoryPct}% · {cat.categorySqft.toLocaleString("en-IN")} sqft
+                    </span>
+                  </div>
+                </div>
+                <div className="space-y-1.5">
+                  {/* Column header */}
+                  <div className="grid grid-cols-[1fr_70px_90px_90px] gap-2 px-1 text-[9.5px] font-bold uppercase tracking-wider text-text-subtle">
+                    <span>Scope</span>
+                    <span className="text-right">Scope %</span>
+                    <span className="text-right">Scope Qty</span>
+                    <span className="text-right">Amount</span>
+                  </div>
+                  {cat.scopes.map((s) => (
+                    <div
+                      key={s.idx}
+                      className="grid grid-cols-[1fr_70px_90px_90px] gap-2 items-center px-1 py-1.5 rounded-lg hover:bg-bg-soft/50"
+                    >
+                      <span className="text-[12px] text-textcolor truncate min-w-0">
+                        {s.itemName || (
+                          <span className="italic text-text-subtle">
+                            Untitled scope
+                          </span>
+                        )}
+                      </span>
+                      <span className="text-[11px] font-semibold text-text-muted tabular-nums text-right">
+                        {s.scopePct}%
+                      </span>
+                      <span className="text-[11px] font-semibold text-textcolor tabular-nums text-right">
+                        {s.scopeQty.toLocaleString("en-IN")}
+                        <span className="text-[9px] text-text-subtle ml-0.5 uppercase">
+                          {s.unit}
+                        </span>
+                      </span>
+                      <span className="text-[11px] font-semibold text-textcolor tabular-nums text-right">
+                        {s.amount > 0 ? formatAmount(s.amount) : "—"}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </Modal>
+  );
+};
+
+// ───────────────────────────────────────────────────────────────────────────
+// Allocation Adjustment Modal — shown when a category's scope total or the
+// category total drifts off 100%. Offers three resolutions with a live impact
+// preview before applying: (1) adjust overall preset Sq.ft, (2) redistribute
+// across the other scopes/categories, (3) cancel and adjust manually.
+// ───────────────────────────────────────────────────────────────────────────
+
+const AllocationAdjustModal = ({
+  data,
+  onAdjustSqft,
+  onRedistribute,
+  onClose,
+}) => {
+  const isScope = data.level === "scope";
+  const T = data.total;
+  const remaining = data.remaining;
+  const over = remaining < 0;
+  const [option, setOption] = useState("redistribute");
+
+  const factor = T > 0 ? T / 100 : 1;
+  const newSizeRange = scaleSizeRange(data.sizeRange, factor);
+  const newStandard = getStandardSqft(newSizeRange);
+
+  // The entry the user just edited — held fixed by the redistribute option.
+  const edited = isScope
+    ? data.scopes.find((s) => s.idx === data.editedIdx) || data.scopes[0]
+    : data.categories.find((c) => c.room === data.editedKey) ||
+      data.categories[0];
+  const editedLabel = isScope ? edited?.name : edited?.room;
+
+  const preview = useMemo(() => {
+    if (isScope) {
+      const entries = data.scopes.map((s) => ({ key: s.idx, pct: s.pct }));
+      const redist = redistributeAllocation(
+        entries,
+        data.editedIdx != null ? data.editedIdx : entries[0]?.key,
+      );
+      const newCatSqft = Math.round(getCategorySqft(newStandard, data.categoryPct));
+      return data.scopes.map((s) => {
+        const normPct = T > 0 ? Math.round((s.pct * 100) / T * 100) / 100 : 0;
+        const redistPct = redist[s.idx] ?? s.pct;
+        return {
+          name: s.name,
+          edited: s.idx === data.editedIdx,
+          oldPct: s.pct,
+          oldQty: s.qty,
+          sqftPct: normPct,
+          sqftQty: Math.round(getScopeQuantity(newCatSqft, normPct)),
+          redistPct,
+          redistQty: Math.round(getScopeQuantity(data.categorySqft, redistPct)),
+        };
+      });
+    }
+    const entries = data.categories.map((c) => ({ key: c.room, pct: c.pct }));
+    const redist = redistributeAllocation(
+      entries,
+      data.editedKey || entries[0]?.key,
+    );
+    return data.categories.map((c) => {
+      const normPct = T > 0 ? Math.round((c.pct * 100) / T * 100) / 100 : 0;
+      const redistPct = redist[c.room] ?? c.pct;
+      return {
+        name: c.room,
+        edited: c.room === data.editedKey,
+        oldPct: c.pct,
+        oldQty: c.qty,
+        sqftPct: normPct,
+        sqftQty: Math.round(getCategorySqft(newStandard, normPct)),
+        redistPct,
+        redistQty: Math.round(getCategorySqft(data.standardSqft, redistPct)),
+      };
+    });
+  }, [data, isScope, T, newStandard]);
+
+  const scopeWord = isScope ? "scope" : "category";
+  const others = preview.filter((r) => !r.edited).length;
+
+  return (
+    <Modal
+      title={`${isScope ? `"${data.category}" scopes` : "Categories"} total ${T}%`}
+      subtitle={
+        over
+          ? `Over by ${Math.abs(remaining)}% — pick how to bring it back to 100%`
+          : `${remaining}% remaining — pick how to reach 100%`
+      }
+      onClose={onClose}
+      maxWidth="max-w-[640px]"
+      footer={
+        <div className="flex items-center justify-between w-full gap-3">
+          <button
+            type="button"
+            onClick={onClose}
+            className="px-4 py-2 rounded-lg border border-bordergray bg-white text-[12px] font-semibold text-text-muted hover:bg-bg-soft transition-all"
+          >
+            Cancel & adjust manually
+          </button>
+          <button
+            type="button"
+            onClick={option === "sqft" ? onAdjustSqft : onRedistribute}
+            className="px-5 py-2 rounded-lg bg-linear-to-br from-select-blue to-primary text-white text-[12px] font-semibold shadow-sm hover:shadow-md hover:shadow-select-blue/20 transition-all"
+          >
+            Apply{option === "sqft" ? " Sq.ft resize" : " redistribution"}
+          </button>
+        </div>
+      }
+    >
+      <div className="space-y-3">
+        {/* Option cards */}
+        <button
+          type="button"
+          onClick={() => setOption("redistribute")}
+          className={`w-full text-left rounded-xl border p-3 transition-all ${
+            option === "redistribute"
+              ? "border-select-blue bg-active-bg/40 ring-2 ring-select-blue/15"
+              : "border-bordergray bg-white hover:bg-bg-soft/60"
+          }`}
+        >
+          <div className="flex items-center gap-2 mb-1">
+            <Scale size={13} className="text-select-blue" />
+            <span className="text-[12.5px] font-bold text-textcolor">
+              Redistribute across other {scopeWord === "scope" ? "scopes" : "categories"}
+            </span>
+          </div>
+          <p className="text-[11px] text-text-muted">
+            Keep{" "}
+            <span className="font-semibold text-textcolor">
+              {editedLabel}
+            </span>{" "}
+            at {edited ? edited.pct : 0}% and rebalance the other {others}{" "}
+            {others === 1 ? scopeWord : `${scopeWord}s`} so the total is 100%.
+            Preset Sq.ft is unchanged.
+          </p>
+        </button>
+
+        <button
+          type="button"
+          onClick={() => setOption("sqft")}
+          className={`w-full text-left rounded-xl border p-3 transition-all ${
+            option === "sqft"
+              ? "border-select-blue bg-active-bg/40 ring-2 ring-select-blue/15"
+              : "border-bordergray bg-white hover:bg-bg-soft/60"
+          }`}
+        >
+          <div className="flex items-center gap-2 mb-1">
+            <Ruler size={13} className="text-select-blue" />
+            <span className="text-[12.5px] font-bold text-textcolor">
+              Adjust overall Property Preset Sq.ft
+            </span>
+          </div>
+          <p className="text-[11px] text-text-muted">
+            Resize the preset from{" "}
+            <span className="font-semibold text-textcolor">
+              {data.standardSqft.toLocaleString("en-IN")}
+            </span>{" "}
+            to{" "}
+            <span className="font-semibold text-textcolor">
+              {newStandard.toLocaleString("en-IN")} sqft
+            </span>{" "}
+            and normalise {isScope ? `"${data.category}"` : "every category"} to
+            100% — the quantities you entered are preserved.
+            {isScope && (
+              <>
+                {" "}
+                Other categories&apos; quantities scale ×{factor.toFixed(2)}.
+              </>
+            )}
+          </p>
+        </button>
+
+        {/* Impact preview */}
+        <div className="rounded-xl border border-bordergray overflow-hidden">
+          <div className="px-3 py-2 bg-bg-soft/50 border-b border-bordergray flex items-center gap-1.5 text-[10.5px] font-bold uppercase tracking-wider text-text-muted">
+            <Eye size={12} className="text-select-blue" /> Impact preview
+            {option === "sqft" && (
+              <span className="ml-auto normal-case tracking-normal font-semibold text-select-blue">
+                Standard {data.standardSqft.toLocaleString("en-IN")} →{" "}
+                {newStandard.toLocaleString("en-IN")} sqft
+              </span>
+            )}
+          </div>
+          <div className="max-h-[260px] overflow-y-auto">
+            <div className="grid grid-cols-[1fr_120px_120px] gap-2 px-3 py-1.5 text-[9.5px] font-bold uppercase tracking-wider text-text-subtle border-b border-bordergray">
+              <span>{isScope ? "Scope" : "Category"}</span>
+              <span className="text-right">% (now → new)</span>
+              <span className="text-right">Qty (now → new)</span>
+            </div>
+            {preview.map((r, i) => {
+              const newPct = option === "sqft" ? r.sqftPct : r.redistPct;
+              const newQty = option === "sqft" ? r.sqftQty : r.redistQty;
+              const pctChanged = newPct !== r.oldPct;
+              const qtyChanged = newQty !== r.oldQty;
+              return (
+                <div
+                  key={i}
+                  className="grid grid-cols-[1fr_120px_120px] gap-2 px-3 py-1.5 items-center text-[11px] border-b border-bordergray/60 last:border-0"
+                >
+                  <span className="text-textcolor truncate min-w-0 flex items-center gap-1.5">
+                    {r.name}
+                    {r.edited && (
+                      <span className="text-[8.5px] font-bold uppercase tracking-wider text-select-blue bg-active-bg/70 px-1 py-0.5 rounded">
+                        edited
+                      </span>
+                    )}
+                  </span>
+                  <span className="text-right tabular-nums">
+                    <span className="text-text-muted">{r.oldPct}%</span>
+                    <span className="text-text-subtle"> → </span>
+                    <span
+                      className={
+                        pctChanged
+                          ? "font-bold text-select-blue"
+                          : "font-semibold text-textcolor"
+                      }
+                    >
+                      {newPct}%
+                    </span>
+                  </span>
+                  <span className="text-right tabular-nums">
+                    <span className="text-text-muted">
+                      {r.oldQty.toLocaleString("en-IN")}
+                    </span>
+                    <span className="text-text-subtle"> → </span>
+                    <span
+                      className={
+                        qtyChanged
+                          ? "font-bold text-select-blue"
+                          : "font-semibold text-textcolor"
+                      }
+                    >
+                      {newQty.toLocaleString("en-IN")}
+                    </span>
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      </div>
+    </Modal>
   );
 };
 
@@ -2331,6 +3575,60 @@ const AmountInput = ({ value, onChange, pct }) => {
           {pct}%
         </span>
       )}
+    </div>
+  );
+};
+
+// Compact 0–100 percentage input used by the Budget Allocation section. Shows
+// a "%" suffix and keeps an empty field empty (rather than forcing a 0).
+const PctInput = ({ value, onChange, onCommit }) => (
+  <div className="relative w-[74px]">
+    <input
+      type="number"
+      min={0}
+      max={100}
+      value={value ?? ""}
+      onChange={(e) => onChange(e.target.value)}
+      onBlur={onCommit}
+      placeholder="0"
+      className={`${inputBase} py-1.5 pr-6 text-right tabular-nums font-semibold`}
+    />
+    <span className="absolute right-2 top-1/2 -translate-y-1/2 text-[10px] font-bold text-text-subtle pointer-events-none">
+      %
+    </span>
+  </div>
+);
+
+// Editable Scope Quantity input (in sq.ft). The displayed value is DERIVED from
+// the stored Scope %, so while focused we show the user's raw keystrokes (a
+// local draft) to avoid the derived round-trip fighting the cursor; on blur it
+// snaps back to the freshly recalculated quantity.
+const QtyInput = ({ value, onChange, disabled, onCommit }) => {
+  const [draft, setDraft] = useState(null);
+  return (
+    <div className="relative w-[92px]">
+      <input
+        type="number"
+        min={0}
+        disabled={disabled}
+        value={draft != null ? draft : (value ?? "")}
+        onFocus={(e) => e.target.select()}
+        onChange={(e) => {
+          setDraft(e.target.value);
+          onChange(e.target.value);
+        }}
+        onBlur={() => {
+          setDraft(null);
+          onCommit?.();
+        }}
+        placeholder="0"
+        className={`${inputBase} py-1.5 pr-9 text-right tabular-nums font-semibold ${
+          disabled ? "opacity-50 cursor-not-allowed" : ""
+        }`}
+      />
+      <span className="absolute right-2 top-1/2 -translate-y-1/2 text-[9px] font-bold text-text-subtle pointer-events-none uppercase">
+        sqft
+      </span>
     </div>
   );
 };

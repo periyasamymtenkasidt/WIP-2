@@ -86,6 +86,7 @@ import {
 import { roomColor } from "../data/categoryColors";
 import CategorySelect from "./CategorySelect";
 import LibraryPickerModal from "./LibraryPickerModal";
+import EstimationReference from "./EstimationReference";
 import { getRoomDefaultDays, getRoomCategoryPresets } from "../data/scheduleConfig";
 
 const SectionHeader = ({ children }) => (
@@ -1380,6 +1381,17 @@ const QuoteModal = ({
           )}
 
           <div className="border-t border-border my-5" />
+
+          {/* Estimation reference — live from Proposal Master, read-only */}
+          {presetKey && (
+            <div className="mb-5">
+              <EstimationReference
+                presetKey={presetKey}
+                propertyType={formData.propertyType}
+                sizeRange={watchedSizeRange}
+              />
+            </div>
+          )}
 
           <div className="mb-5">
             <div className="flex justify-between items-center mb-3">

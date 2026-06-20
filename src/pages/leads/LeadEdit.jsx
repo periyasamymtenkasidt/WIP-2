@@ -8,6 +8,7 @@ import ConvertToClientForm from "./ConvertToClientForm";
 import NegotiationModal from "../projects/NegotiationModal";
 import LogActivityModal from "../projects/LogActivityModal";
 import QuoteModal from "../../components/QuoteModal";
+import EstimationReference from "../../components/EstimationReference";
 import SampleQuoteModal from "../../components/SampleQuoteModal";
 import FeeProposalModal from "../../components/FeeProposalModal";
 import PrelimVisitModal from "../../components/PrelimVisitModal";
@@ -1153,6 +1154,16 @@ const LeadEdit = () => {
               </div>
             </div>
           </div>
+
+          {/* Estimation reference — live from Proposal Master, read-only */}
+          {lead.quotePreset && (
+            <EstimationReference
+              presetKey={lead.quotePreset}
+              propertyType={lead.propertyType}
+              sizeRange={lead.quoteSizeRange}
+              title="Scope Estimation Reference"
+            />
+          )}
 
           {/* Card 3: Activity Timeline (driven by status changes) */}
           <div className="bg-white rounded-[20px] p-8 shadow-[0_2px_10px_-4px_rgba(0,0,0,0.1)]">
